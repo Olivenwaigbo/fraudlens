@@ -1,0 +1,53 @@
+transaction_id,investigation,combined_risk_score,combined_risk_level,investigation_priority,ai_interpretation,full_investigation,risk_score,risk_level,interpretation_source
+TXN-00001903-S,,,,URGENT_REVIEW,"The transaction shows 28 transactions in the past hour, 13 failed attempts in the past 24 hours, a rapid succession of 4 prior transactions with only 1 minute since the previous one, a high amount of 200,000.00 NGN (totaling 639,837.38 NGN in the past 24 hours), usage of a new iOS device versus the primary Android device, and a new location in Enugu differing from the home location in Benin City, triggering rule signals such as HIGH_VELOCITY, HIGH_VALUE, NEW_DEVICE, NEW_LOCATION, FAILED_ATTEMPTS, RAPID_TRANSACTION and MULTIPLE_SIGNALS, with the anomaly detector recording a HIGH anomaly level. These signals warrant human‑led review but do not establish that a real‑world fraud event occurred.","INVESTIGATION SUMMARY
+
+FraudLens flagged transaction TXN-00001903-S for human investigation. The recorded combined risk score is 99.83, with risk level HIGH and investigation priority URGENT_REVIEW.
+
+AI interpretation (model: openai/gpt-oss-120b, validated):
+The transaction shows 28 transactions in the past hour, 13 failed attempts in the past 24 hours, a rapid succession of 4 prior transactions with only 1 minute since the previous one, a high amount of 200,000.00 NGN (totaling 639,837.38 NGN in the past 24 hours), usage of a new iOS device versus the primary Android device, and a new location in Enugu differing from the home location in Benin City, triggering rule signals such as HIGH_VELOCITY, HIGH_VALUE, NEW_DEVICE, NEW_LOCATION, FAILED_ATTEMPTS, RAPID_TRANSACTION and MULTIPLE_SIGNALS, with the anomaly detector recording a HIGH anomaly level. These signals warrant human‑led review but do not establish that a real‑world fraud event occurred.
+
+OBSERVED PATTERN
+
+The account is established (789 days old), yet this transaction combines a device and location change with 13 failed attempts in 24 hours and 28 transactions in the past hour. A reviewer may wish to test the hypothesis that the account was accessed by someone other than the account holder. This is a hypothesis to test, not a finding.
+
+RISK EVIDENCE
+
+- Transaction amount: 200,000.00 NGN
+- Transactions in the past hour: 28
+- Minutes since previous transaction: 1
+- Previous transaction count: 4
+- Failed attempts in the past 24 hours: 13
+- Total amount in the past 24 hours: 639,837.38 NGN
+- New device indicator: Yes
+- New location indicator: Yes
+- Device type: iOS (primary: Android)
+- Location: Enugu (home: Benin City)
+- Merchant category: Healthcare
+- Account age: 789 days
+- Rule engine signals: HIGH_VELOCITY, HIGH_VALUE, NEW_DEVICE, NEW_LOCATION, FAILED_ATTEMPTS, RAPID_TRANSACTION, MULTIPLE_SIGNALS
+
+MODEL SIGNALS
+
+- Rule engine: score 100.00 with 7 recorded signal(s), listed above.
+- Isolation Forest: anomaly_detected = Yes, anomaly_level = HIGH, anomaly_score = -0.259152.
+- Logistic regression (synthetic labelled data): fraud_probability output = 1.0000, classifier prediction = 1.
+- Combined score: 99.83, risk level HIGH, priority URGENT_REVIEW.
+
+WHAT IS UNKNOWN
+
+- Whether the customer authorized the transaction.
+- The purpose of the transaction beyond the recorded merchant category (Healthcare).
+- Whether relevant context exists outside the evidence supplied to FraudLens.
+- Whether the model signals correspond to an actual fraud event.
+
+RECOMMENDED NEXT STEPS
+
+1. Review the failed-attempt log for the past 24 hours (timing, channel, and error type).
+2. Compare the device and IP history for this account against the new device and location.
+3. Review the sequence of recent transactions, including amounts, timing, and merchants.
+4. Verify the activity with the account holder through a trusted, previously registered channel, following the payment or fraud-review process.
+5. Record the reviewer's decision and rationale separately from these model outputs.
+
+CONFIDENCE NOTE
+
+FraudLens is an experimental project operating on synthetic data. Its rule engine, anomaly detector, supervised classifier, and combined score produce investigative signals, not proof, and should be interpreted within a human-led review process. Classifier probabilities at or near 1.0 on synthetic data can reflect easily separable synthetic patterns and should not be read as real-world certainty.",99.83,HIGH,ai_validated
