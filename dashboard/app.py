@@ -21,8 +21,9 @@ st.set_page_config(
 BASE_DIR = Path(__file__).resolve().parents[1]
 DATA_DIR = BASE_DIR / "data"
 
-# Model used for the AI follow-up chat (override with env var if needed)
-AI_MODEL = os.getenv("FRAUDLENS_AI_MODEL", "claude-sonnet-5-5")
+# Model used for the AI follow-up chat, served by Groq.
+# Override with the FRAUDLENS_AI_MODEL env var / Streamlit secret if needed.
+AI_MODEL = os.getenv("FRAUDLENS_AI_MODEL", "openai/gpt-oss-20b")
 
 # ============================================================
 # PALETTE
@@ -370,11 +371,11 @@ def portfolio_context(df):
 
 
 def get_api_key():
-    key = os.getenv("ANTHROPIC_API_KEY")
+    key = os.getenv("GROQ_API_KEY")
     if key:
         return key
     try:
-        return st.secrets.get("ANTHROPIC_API_KEY")
+        return st.secrets.get("GROQ_API_KEY")
     except Exception:
         return None
 
@@ -384,7 +385,7 @@ def local_answer(question, record):
     q = question.lower()
     if record is None:
         return ("Portfolio-level questions need the live AI assistant. Add an "
-                "`ANTHROPIC_API_KEY` (env var or Streamlit secrets) to enable it.")
+                "`GROQ_API_KEY` (env var or Streamlit secrets) to enable it.")
 
     score = record.get("risk_score")
     level = safe_text(record.get("risk_level"))
@@ -430,20 +431,28 @@ def ask_ai(history, record, scope_df):
     key = get_api_key()
     if not key:
         return local_answer(history[-1]["content"], record) + (
-            "\n\n_Offline mode: set `ANTHROPIC_API_KEY` for full AI answers._"
+            "\n\n_Offline mode: set `GROQ_API_KEY` for full AI answers._"
         )
     try:
-        import anthropic
+        from groq import Groq
 
-        client = anthropic.Anthropic(api_key=key)
+        client = Groq(api_key=key)
         context = transaction_context(record) if record is not None else portfolio_context(scope_df)
-        response = client.messages.create(
+        response = client.chat.completions.create(
             model=AI_MODEL,
             max_tokens=800,
-            system=AI_SYSTEM_PROMPT + context,
-            messages=[{"role": m["role"], "content": m["content"]} for m in history],
+            temperature=0.2,
+            messages=(
+                [{"role": "system", "content": AI_SYSTEM_PROMPT + context}]
+                + [{"role": m["role"], "content": m["content"]} for m in history]
+            ),
         )
-        return "".join(b.text for b in response.content if b.type == "text")
+        answer = (response.choices[0].message.content or "").strip()
+        if not answer:
+            return "The AI assistant returned an empty answer.\n\n" + local_answer(
+                history[-1]["content"], record
+            )
+        return answer
     except Exception as e:
         return f"The AI assistant could not respond ({e}).\n\n" + local_answer(
             history[-1]["content"], record
@@ -987,7 +996,7 @@ elif page == "AI Explainer":
     top_l.caption(
         "Live AI answers are enabled."
         if get_api_key()
-        else "Offline mode: add `ANTHROPIC_API_KEY` to enable full AI answers."
+        else "Offline mode: add `GROQ_API_KEY` to enable full AI answers."
     )
     if top_r.button("Clear chat", key=f"clear_{chat_key}"):
         st.session_state[chat_key] = []
