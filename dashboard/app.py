@@ -1,4 +1,5 @@
 import os
+import re
 from pathlib import Path
 
 import pandas as pd
@@ -23,7 +24,15 @@ DATA_DIR = BASE_DIR / "data"
 
 # Model used for the AI follow-up chat, served by Groq.
 # Override with the FRAUDLENS_AI_MODEL env var / Streamlit secret if needed.
-AI_MODEL = os.getenv("FRAUDLENS_AI_MODEL", "openai/gpt-oss-20b")
+AI_MODEL = os.getenv("FRAUDLENS_AI_MODEL", "openai/gpt-oss-120b")
+
+
+def completion_limits(max_output):
+    """gpt-oss is a reasoning model: hidden reasoning tokens count against the
+    completion limit, so use a larger limit and low reasoning effort."""
+    if "gpt-oss" in AI_MODEL:
+        return {"max_completion_tokens": max(max_output, 1024), "reasoning_effort": "low"}
+    return {"max_tokens": max_output}
 
 # ============================================================
 # PALETTE
@@ -440,8 +449,8 @@ def ask_ai(history, record, scope_df):
         context = transaction_context(record) if record is not None else portfolio_context(scope_df)
         response = client.chat.completions.create(
             model=AI_MODEL,
-            max_tokens=800,
             temperature=0.2,
+            **completion_limits(1200),
             messages=(
                 [{"role": "system", "content": AI_SYSTEM_PROMPT + context}]
                 + [{"role": m["role"], "content": m["content"]} for m in history]
@@ -457,6 +466,293 @@ def ask_ai(history, record, scope_df):
         return f"The AI assistant could not respond ({e}).\n\n" + local_answer(
             history[-1]["content"], record
         )
+
+
+# ============================================================
+# ON-DEMAND INVESTIGATION
+# FraudLens only stores AI investigations for selected cases. For any
+# other transaction this builds one from the recorded evidence, using
+# Groq when a key is available and a deterministic template otherwise.
+# ============================================================
+
+INTERP_PROMPT = """You are writing an investigation interpretation for FraudLens, an
+experimental payment-risk prototype using synthetic data.
+
+Write exactly TWO concise sentences.
+
+Sentence 1: describe the observable indicators in the evidence, using specific values
+(counts, devices, locations). If few indicators are elevated, say so plainly.
+
+Sentence 2: state that the signals support human-led review but do not establish that
+a real-world fraud event occurred.
+
+Rules:
+- Use ONLY the evidence below. Never invent facts.
+- Never say fraud occurred or call the transaction fraudulent.
+- Never infer customer intent.
+- Do not recommend blocking, declining, freezing, reversing, approving or releasing anything.
+- Do not describe the raw anomaly score as high or low.
+- Do not describe the classifier probability as a real-world probability.
+- Plain text only, no markdown.
+
+EVIDENCE:
+"""
+
+FORBIDDEN_PHRASES = [
+    "fraud occurred", "fraudulent transaction", "confirmed fraud",
+    "definitely fraud", "this is fraud", "criminal intent",
+    "block the transaction", "decline the transaction", "freeze the account",
+    "reverse the transaction", "approve the transaction",
+    "release the transaction", "high anomaly score", "low anomaly score",
+]
+
+SOURCE_AI = "AI-generated on demand (Groq)"
+SOURCE_FALLBACK = "Deterministic template (AI unavailable or rejected)"
+
+
+def _num(value):
+    v = pd.to_numeric(value, errors="coerce")
+    return None if pd.isna(v) else float(v)
+
+
+def _is_yes(value):
+    return str(value).strip().lower() in {"1", "1.0", "true", "yes"}
+
+
+def _join(items):
+    if not items:
+        return ""
+    if len(items) == 1:
+        return items[0]
+    if len(items) == 2:
+        return f"{items[0]} and {items[1]}"
+    return ", ".join(items[:-1]) + f", and {items[-1]}"
+
+
+def clean_ai_text(text):
+    if not text:
+        return ""
+    text = str(text).replace("**", "").replace("__", "")
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def valid_interpretation(text):
+    if not text:
+        return False
+    low = text.lower()
+    if any(p in low for p in FORBIDDEN_PHRASES):
+        return False
+    if "human" not in low:
+        return False
+    sentences = [s for s in re.split(r"(?<=[.!?])\s+", text.strip()) if s.strip()]
+    return len(sentences) <= 3
+
+
+def indicator_phrases(record):
+    out = []
+
+    t1h = _num(record.get("transactions_1h"))
+    if t1h is not None:
+        out.append(f"{t1h:,.0f} transaction{'s' if t1h != 1 else ''} in the past hour")
+
+    failed = _num(record.get("failed_attempts_24h"))
+    if failed:
+        out.append(f"{failed:,.0f} failed attempt{'s' if failed != 1 else ''} in the past 24 hours")
+
+    if _is_yes(record.get("is_new_device")):
+        out.append(
+            f"a new device ({safe_text(record.get('device_type'))} versus "
+            f"primary {safe_text(record.get('primary_device_type'))})"
+        )
+
+    if _is_yes(record.get("is_new_location")):
+        out.append(
+            f"a new location ({safe_text(record.get('location'))} versus "
+            f"home {safe_text(record.get('home_location'))})"
+        )
+
+    return out
+
+
+def clean_signals(record):
+    raw = record.get("rule_signals")
+    if not isinstance(raw, str) or not raw.strip():
+        return ""
+    parts = [p.strip() for p in re.split(r"[;,|]", raw) if p.strip()]
+    return ", ".join(dict.fromkeys(parts))
+
+
+def fallback_interpretation(record):
+    score = _num(record.get("risk_score"))
+    level = safe_text(record.get("risk_level")).lower()
+    phrases = indicator_phrases(record)
+    signals = clean_signals(record)
+
+    first = f"The transaction has a {level} combined risk score"
+    if score is not None:
+        first += f" of {score:.2f}"
+    if phrases:
+        first += f", with {_join(phrases)}"
+    first += "."
+    if signals:
+        first += f" The rule engine recorded these signals: {signals}."
+    else:
+        first += " The rule engine recorded no signals."
+
+    second = (
+        "These are investigative signals that support human-led review and do "
+        "not establish that a real-world fraud event occurred."
+    )
+    return f"{first} {second}"
+
+
+def ai_interpretation_for(record, use_ai=True):
+    key = get_api_key() if use_ai else None
+    if key:
+        try:
+            from groq import Groq
+
+            client = Groq(api_key=key)
+            response = client.chat.completions.create(
+                model=AI_MODEL,
+                temperature=0.1,
+                **completion_limits(1024),
+                messages=[
+                    {
+                        "role": "system",
+                        "content": (
+                            "You are a careful financial-risk investigation writing "
+                            "assistant. Follow the evidence and constraints exactly."
+                        ),
+                    },
+                    {"role": "user", "content": INTERP_PROMPT + transaction_context(record)},
+                ],
+            )
+            text = clean_ai_text(response.choices[0].message.content)
+            if valid_interpretation(text):
+                return text, SOURCE_AI
+        except Exception:
+            pass
+    return fallback_interpretation(record), SOURCE_FALLBACK
+
+
+def build_full_record(record, interpretation, summary):
+    def line(label, value):
+        return f"- {label}: {value}"
+
+    amount = format_currency(record.get("amount"), safe_text(record.get("currency")) if "currency" in record.index else "")
+    return "\n".join([
+        "INVESTIGATION SUMMARY",
+        "",
+        summary,
+        "",
+        "INTERPRETATION",
+        "",
+        interpretation,
+        "",
+        "RISK EVIDENCE",
+        "",
+        line("Transaction amount", amount),
+        line("Transactions in the past hour", safe_text(record.get("transactions_1h"))),
+        line("Minutes since previous transaction", safe_text(record.get("minutes_since_previous"))),
+        line("Failed attempts in the past 24 hours", safe_text(record.get("failed_attempts_24h"))),
+        line("Total amount in the past 24 hours", safe_text(record.get("amount_24h"))),
+        line("Device", f"{safe_text(record.get('device_type'))} (primary: {safe_text(record.get('primary_device_type'))})"),
+        line("Location", f"{safe_text(record.get('location'))} (home: {safe_text(record.get('home_location'))})"),
+        line("Merchant category", safe_text(record.get("merchant_category"))),
+        line("Account age (days)", safe_text(record.get("account_age_days"))),
+        line("Rule signals", clean_signals(record) or "None recorded"),
+        line("Anomaly level", safe_text(record.get("anomaly_level"))),
+        line("Classifier output (synthetic)", safe_text(record.get("fraud_probability"))),
+        line("Classifier prediction", safe_text(record.get("classifier_prediction"))),
+        "",
+        "WHAT IS UNKNOWN",
+        "",
+        "- Whether the customer authorised the transaction.",
+        "- The purpose of the transaction beyond the recorded merchant category.",
+        "- Whether relevant context exists outside the evidence supplied to FraudLens.",
+        "",
+        "RECOMMENDED NEXT STEPS",
+        "",
+        "1. Review the failed-attempt log for the past 24 hours.",
+        "2. Compare device and IP history against the recorded device and location.",
+        "3. Review the sequence of recent transactions.",
+        "4. Record the reviewer's decision separately from these model outputs.",
+        "",
+        "CONFIDENCE NOTE",
+        "",
+        "FraudLens is an experimental project on synthetic data. Its outputs are "
+        "investigative signals, not proof, and belong in a human-led review process.",
+    ])
+
+
+def generate_investigation(record, use_ai=True):
+    interpretation, source = ai_interpretation_for(record, use_ai)
+    score = _num(record.get("risk_score"))
+    summary = (
+        f"FraudLens recorded a combined risk score of "
+        f"{score:.2f}" if score is not None else "FraudLens recorded a combined risk score"
+    ) + (
+        f", risk level {safe_text(record.get('risk_level'))} and investigation "
+        f"priority {safe_text(record.get('investigation_priority'))} for transaction "
+        f"{safe_text(record.get('transaction_id'))}."
+    )
+    return {
+        "interpretation": interpretation,
+        "summary": summary,
+        "full": build_full_record(record, interpretation, summary),
+        "source": source,
+    }
+
+
+# ============================================================
+# COLLECTIVE (PORTFOLIO) SUMMARY
+# Built from the recorded results, so it works for every filter and
+# never needs an API call.
+# ============================================================
+
+def portfolio_summary(df):
+    n = len(df)
+    if n == 0:
+        return "No transactions match the current filters."
+
+    parts = []
+
+    levels = df["risk_level"].value_counts() if "risk_level" in df.columns else None
+    if levels is not None and len(levels):
+        mix = ", ".join(f"{count:,} {level.lower()}" for level, count in levels.items())
+        parts.append(f"The current view contains {n:,} transactions ({mix}).")
+    else:
+        parts.append(f"The current view contains {n:,} transactions.")
+
+    if "risk_score" in df.columns:
+        parts.append(
+            f"The average combined risk score is {df['risk_score'].mean():.2f} and "
+            f"the highest is {df['risk_score'].max():.2f}."
+        )
+
+    if "rule_signals" in df.columns:
+        counts = {}
+        for raw in df["rule_signals"].dropna().astype(str):
+            for sig in dict.fromkeys(p.strip() for p in re.split(r"[;,|]", raw) if p.strip()):
+                counts[sig] = counts.get(sig, 0) + 1
+        if counts:
+            top = sorted(counts.items(), key=lambda kv: kv[1], reverse=True)[:4]
+            parts.append(
+                "The most frequent rule signals are "
+                + _join([f"{name} ({count:,})" for name, count in top]) + "."
+            )
+
+    for col, label in [("is_new_device", "a new device"), ("is_new_location", "a new location")]:
+        if col in df.columns:
+            share = df[col].apply(_is_yes).mean() * 100
+            parts.append(f"{share:.1f}% of transactions involve {label}.")
+
+    parts.append(
+        "These are investigative signals that support human-led review and do not "
+        "establish that a real-world fraud event occurred."
+    )
+    return " ".join(parts)
 
 
 # ============================================================
@@ -943,20 +1239,67 @@ elif page == "AI Explainer":
         "Where should the team focus first?",
     ]
 
+    if scope == "Whole filtered portfolio":
+        st.markdown("### Portfolio Summary")
+        st.info(portfolio_summary(filtered))
+
+        if "risk_score" in filtered.columns and len(filtered):
+            st.markdown("#### Top cases in this view")
+            top_cases = filtered.sort_values("risk_score", ascending=False).head(5)
+            for _, row in top_cases.iterrows():
+                stored = row.get("ai_interpretation")
+                text = (
+                    stored.strip()
+                    if isinstance(stored, str) and stored.strip()
+                    else fallback_interpretation(row)
+                )
+                with st.expander(
+                    f"{safe_text(row.get('transaction_id'))} · score "
+                    f"{row.get('risk_score', 0):.2f} · {safe_text(row.get('risk_level'))}"
+                ):
+                    st.markdown(text)
+
     if scope == "One transaction":
         ids = filtered["transaction_id"].dropna().astype(str).tolist()
         selected = st.selectbox("Select transaction", ids, key="ai_transaction")
         record = filtered[filtered["transaction_id"] == selected].iloc[0]
         chat_key = f"chat_{selected}"
 
-        summary = record.get("investigation")
-        if pd.isna(summary) or not str(summary).strip():
-            summary = record.get("ai_interpretation")
-        if pd.isna(summary) or not str(summary).strip():
-            summary = "No AI investigation summary is available for this transaction."
+        gen_key = f"gen_{selected}"
+        stored_interp = record.get("ai_interpretation")
+        has_stored = isinstance(stored_interp, str) and stored_interp.strip() != ""
+        generated = st.session_state.get(gen_key)
+
+        if has_stored:
+            interp_text = stored_interp.strip()
+            full_text = record.get("full_investigation")
+            source = safe_text(record.get("interpretation_source"))
+            summary = record.get("investigation")
+            if not isinstance(summary, str) or not summary.strip():
+                summary = interp_text
+        elif generated:
+            interp_text = generated["interpretation"]
+            full_text = generated["full"]
+            source = generated["source"]
+            summary = generated["summary"]
+        else:
+            # Always show a summary: build it instantly from the recorded
+            # evidence (no API call), and let the reviewer upgrade it with AI.
+            base = generate_investigation(record, use_ai=False)
+            interp_text, full_text = base["interpretation"], base["full"]
+            source, summary = base["source"], base["summary"]
 
         st.markdown("### Investigation Summary")
         st.info(str(summary))
+
+        if not has_stored and not generated:
+            if get_api_key():
+                if st.button("✨ Rewrite with AI", key=f"gen_btn_{selected}"):
+                    with st.spinner("Writing AI interpretation from the recorded evidence..."):
+                        st.session_state[gen_key] = generate_investigation(record, use_ai=True)
+                    st.rerun()
+            else:
+                st.caption("Add `GROQ_API_KEY` to enable the AI-written version.")
 
         c1, c2, c3 = st.columns(3)
         c1.metric("Combined Risk Score", f"{record.get('risk_score', 0):.2f}")
@@ -965,20 +1308,12 @@ elif page == "AI Explainer":
         c3.metric("Investigation Priority", safe_text(record.get("investigation_priority")))
 
         with st.expander("🧠 AI interpretation", expanded=True):
-            interp = record.get("ai_interpretation")
-            if pd.isna(interp) or not str(interp).strip():
-                st.info("No AI interpretation is available.")
-            else:
-                st.markdown(str(interp))
+            st.markdown(str(interp_text))
 
         with st.expander("📂 Full investigation record"):
-            full = record.get("full_investigation")
-            if pd.isna(full) or not str(full).strip():
-                st.info("No full investigation record is available.")
-            else:
-                st.text_area("Investigation record", str(full), height=350, disabled=True)
+            st.text_area("Investigation record", str(full_text), height=350, disabled=True)
 
-        st.caption(f"Interpretation source: {safe_text(record.get('interpretation_source'))}")
+        st.caption(f"Interpretation source: {source}")
 
         suggestions = [
             "Why was this flagged?",
