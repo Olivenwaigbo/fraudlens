@@ -94,6 +94,7 @@ st.markdown(
             border-radius: 12px; padding: 1rem 1.1rem;
             box-shadow: 0 2px 10px rgba(124, 58, 237, 0.07);
             transition: transform .15s ease, box-shadow .15s ease;
+            min-height: 132px; box-sizing: border-box;
         }}
         .kpi:hover {{ transform: translateY(-3px); box-shadow: 0 8px 22px rgba(124, 58, 237, 0.18); }}
         .kpi-label {{ color: #6b7280; font-size: .8rem; text-transform: uppercase; letter-spacing: .06em; }}
@@ -275,12 +276,38 @@ def style_fig(fig, height=340):
         paper_bgcolor="white",
         plot_bgcolor="white",
         font=dict(color=PURPLE_900),
-        margin=dict(l=10, r=10, t=40, b=10),
-        legend=dict(orientation="h", y=-0.15),
+        margin=dict(l=10, r=10, t=50, b=80),
+        legend=dict(orientation="h", yanchor="top", y=-0.28, x=0),
     )
-    fig.update_xaxes(gridcolor=PURPLE_100)
-    fig.update_yaxes(gridcolor=PURPLE_100)
+    axis = dict(
+        gridcolor=PURPLE_100,
+        showline=True,
+        linecolor=PURPLE_300,
+        zeroline=False,
+        showticklabels=True,
+        tickfont=dict(color=PURPLE_900, size=12),
+        title_font=dict(color=PURPLE_900, size=13),
+        automargin=True,
+    )
+    fig.update_xaxes(**axis)
+    fig.update_yaxes(**axis)
+    fig.update_layout(
+        legend_font=dict(color=PURPLE_900),
+        title_font=dict(color=PURPLE_900),
+    )
     return fig
+
+
+def show_chart(fig):
+    """Render a Plotly chart with OUR colours. Streamlit's default theme
+    overrides chart text colours to match the app theme, which makes axes
+    and legends white-on-white on dark-mode devices and in PNG exports."""
+    st.plotly_chart(
+        fig,
+        use_container_width=True,
+        theme=None,
+        config={"toImageButtonOptions": {"format": "png", "scale": 2}},
+    )
 
 
 def gauge(score):
@@ -755,6 +782,46 @@ def portfolio_summary(df):
     return " ".join(parts)
 
 
+def render_chat(chat_key, record, scope_df, suggestions, heading="### 💬 Ask a follow-up"):
+    """Follow-up AI chat. record=None means a whole-portfolio conversation."""
+    st.markdown(heading)
+
+    history = st.session_state.setdefault(chat_key, [])
+
+    top_l, top_r = st.columns([4, 1])
+    top_l.caption(
+        "Live AI answers are enabled."
+        if get_api_key()
+        else "Offline mode: add `GROQ_API_KEY` to enable full AI answers."
+    )
+    if top_r.button("Clear chat", key=f"clear_{chat_key}"):
+        st.session_state[chat_key] = []
+        st.rerun()
+
+    for msg in history:
+        with st.chat_message(msg["role"], avatar="🧑‍💼" if msg["role"] == "user" else "🛡️"):
+            st.markdown(msg["content"])
+
+    pending = None
+    chip_cols = st.columns(len(suggestions))
+    for i, (col, text) in enumerate(zip(chip_cols, suggestions)):
+        if col.button(text, key=f"sug_{chat_key}_{i}", use_container_width=True):
+            pending = text
+
+    typed = st.chat_input("Ask anything about this case, e.g. 'What would make this look legitimate?'")
+    question = typed or pending
+
+    if question:
+        history.append({"role": "user", "content": question})
+        with st.chat_message("user", avatar="🧑‍💼"):
+            st.markdown(question)
+        with st.chat_message("assistant", avatar="🛡️"):
+            with st.spinner("Analysing signals..."):
+                answer = ask_ai(history, record, scope_df)
+            st.markdown(answer)
+        history.append({"role": "assistant", "content": answer})
+
+
 # ============================================================
 # SIDEBAR
 # ============================================================
@@ -894,7 +961,7 @@ if page == "Overview":
     k[1].markdown(kpi("High risk", f"{high:,}", f"{high / total:.1%} of view"), unsafe_allow_html=True)
     k[2].markdown(kpi("Medium risk", f"{medium:,}", f"{medium / total:.1%} of view"), unsafe_allow_html=True)
     k[3].markdown(kpi("Avg risk score", f"{avg_risk:.1f}", "out of 100"), unsafe_allow_html=True)
-    k[4].markdown(kpi("Urgent reviews", f"{urgent:,}", f"High-risk value {exposure:,.0f}"), unsafe_allow_html=True)
+    k[4].markdown(kpi("Urgent reviews", f"{urgent:,}", (f"{exposure / 1000:,.0f}k at risk" if exposure >= 10000 else f"{exposure:,.0f} at risk")), unsafe_allow_html=True)
 
     section("Distribution")
     left, right = st.columns(2)
@@ -908,7 +975,7 @@ if page == "Overview":
             title="Risk level mix",
         )
         fig.update_traces(textinfo="percent+label")
-        st.plotly_chart(style_fig(fig), use_container_width=True)
+        show_chart(style_fig(fig))
 
     with right:
         if "investigation_priority" in filtered.columns:
@@ -920,7 +987,7 @@ if page == "Overview":
                 title="Investigation priority",
             )
             fig.update_layout(coloraxis_showscale=False)
-            st.plotly_chart(style_fig(fig), use_container_width=True)
+            show_chart(style_fig(fig))
 
     left, right = st.columns(2)
 
@@ -930,7 +997,7 @@ if page == "Overview":
             color="risk_level", color_discrete_map=LEVEL_COLORS,
             title="Combined risk score distribution",
         )
-        st.plotly_chart(style_fig(fig), use_container_width=True)
+        show_chart(style_fig(fig))
 
     with right:
         if "amount" in filtered.columns:
@@ -941,7 +1008,7 @@ if page == "Overview":
                 hover_data=hover, opacity=0.75,
                 title="Amount vs risk score (hover for details)",
             )
-            st.plotly_chart(style_fig(fig), use_container_width=True)
+            show_chart(style_fig(fig))
 
     if "created_at" in filtered.columns and filtered["created_at"].notna().any():
         section("Risk over time")
@@ -958,7 +1025,7 @@ if page == "Overview":
         fig.add_scatter(x=trend["day"], y=trend["avg_risk"], name="Avg risk score",
                         yaxis="y2", line=dict(color=PURPLE_700, width=3))
         fig.update_layout(yaxis2=dict(overlaying="y", side="right", showgrid=False))
-        st.plotly_chart(style_fig(fig, 320), use_container_width=True)
+        show_chart(style_fig(fig, 320))
 
     if "scenario_type" in filtered.columns:
         section("Scenarios by average risk")
@@ -971,7 +1038,7 @@ if page == "Overview":
                      color="avg_risk", color_continuous_scale=PURPLE_SCALE,
                      hover_data=["count"])
         fig.update_layout(coloraxis_showscale=False)
-        st.plotly_chart(style_fig(fig, 320), use_container_width=True)
+        show_chart(style_fig(fig, 320))
 
     section("Highest-Risk Transactions")
     cols = [c for c in ["transaction_id", "amount", "risk_score", "risk_level",
@@ -1031,10 +1098,22 @@ elif page == "Investigations":
         rec = filtered[filtered["transaction_id"] == spotlight].iloc[0]
         a, b = st.columns([1, 1])
         with a:
-            st.plotly_chart(gauge(rec.get("risk_score")), use_container_width=True)
+            show_chart(gauge(rec.get("risk_score")))
         with b:
-            st.plotly_chart(component_radar(rec), use_container_width=True)
-        st.info("Open **AI Explainer** to ask follow-up questions about this case.")
+            show_chart(component_radar(rec))
+        st.divider()
+        render_chat(
+            f"chat_{spotlight}",
+            rec,
+            filtered,
+            [
+                "Why was this flagged?",
+                "What should I check next?",
+                "How reliable is this score?",
+                "Is the device or location suspicious?",
+            ],
+            heading="### 💬 Ask AI about this case",
+        )
 
 
 # ============================================================
@@ -1053,9 +1132,9 @@ elif page == "Transaction Explorer":
 
     g1, g2, g3 = st.columns([1.2, 1, 1])
     with g1:
-        st.plotly_chart(gauge(record.get("risk_score")), use_container_width=True)
+        show_chart(gauge(record.get("risk_score")))
     with g2:
-        st.plotly_chart(component_radar(record), use_container_width=True)
+        show_chart(component_radar(record))
     with g3:
         st.metric("Transaction ID", safe_text(record.get("transaction_id")))
         st.metric("Amount", format_currency(record.get("amount"), record.get("currency", "")))
@@ -1115,7 +1194,20 @@ elif page == "Transaction Explorer":
             st.info("No combined risk evidence was recorded for this transaction.")
         else:
             st.info(str(evidence))
-        st.caption("Want to dig deeper? Ask follow-up questions in the **AI Explainer** page.")
+
+        st.divider()
+        render_chat(
+            f"chat_{selected}",
+            record,
+            filtered,
+            [
+                "Why was this flagged?",
+                "What should I check next?",
+                "How reliable is this score?",
+                "Is the device or location suspicious?",
+            ],
+            heading="### 💬 Ask AI about this transaction",
+        )
 
 
 # ============================================================
@@ -1156,7 +1248,7 @@ elif page == "Model Signals":
             fig = px.bar(rdf, x="Model", y="Detection rate (%)",
                          color="Detection rate (%)", color_continuous_scale=PURPLE_SCALE)
             fig.update_layout(coloraxis_showscale=False)
-            st.plotly_chart(style_fig(fig), use_container_width=True)
+            show_chart(style_fig(fig))
 
     with right:
         section("Average contribution by risk level")
@@ -1167,7 +1259,7 @@ elif page == "Model Signals":
             fig = px.bar(melted, x="risk_level", y="Average", color="Component",
                          barmode="stack",
                          color_discrete_sequence=[PURPLE_900, PURPLE_500, PURPLE_300])
-            st.plotly_chart(style_fig(fig), use_container_width=True)
+            show_chart(style_fig(fig))
 
     section("Do the models agree?")
     if {"anomaly_score", "fraud_probability"}.issubset(filtered.columns):
@@ -1178,7 +1270,7 @@ elif page == "Model Signals":
             hover_data=hover, opacity=0.8,
             title="Anomaly score vs classifier probability (colour = combined risk)",
         )
-        st.plotly_chart(style_fig(fig, 400), use_container_width=True)
+        show_chart(style_fig(fig, 400))
         st.caption(
             "Points where one model is high and the other low are worth a manual look: "
             "they show cases where a single approach would have missed the signal."
@@ -1196,7 +1288,7 @@ elif page == "Model Signals":
                      orientation="h",
                      color_discrete_sequence=[PURPLE_900, PURPLE_500, PURPLE_300])
         fig.update_layout(yaxis=dict(autorange="reversed"))
-        st.plotly_chart(style_fig(fig, 460), use_container_width=True)
+        show_chart(style_fig(fig, 460))
 
     section("Model output comparison")
     cols = [c for c in ["transaction_id", "rule_risk_score", "anomaly_score",
@@ -1322,43 +1414,7 @@ elif page == "AI Explainer":
             "Is the device or location suspicious?",
         ]
 
-    # ---------------- Chat ----------------
-    st.markdown("### 💬 Ask a follow-up")
-
-    history = st.session_state.setdefault(chat_key, [])
-
-    top_l, top_r = st.columns([4, 1])
-    top_l.caption(
-        "Live AI answers are enabled."
-        if get_api_key()
-        else "Offline mode: add `GROQ_API_KEY` to enable full AI answers."
-    )
-    if top_r.button("Clear chat", key=f"clear_{chat_key}"):
-        st.session_state[chat_key] = []
-        st.rerun()
-
-    for msg in history:
-        with st.chat_message(msg["role"], avatar="🧑‍💼" if msg["role"] == "user" else "🛡️"):
-            st.markdown(msg["content"])
-
-    pending = None
-    chip_cols = st.columns(len(suggestions))
-    for i, (col, text) in enumerate(zip(chip_cols, suggestions)):
-        if col.button(text, key=f"sug_{chat_key}_{i}", use_container_width=True):
-            pending = text
-
-    typed = st.chat_input("Ask anything about this case, e.g. 'What would make this look legitimate?'")
-    question = typed or pending
-
-    if question:
-        history.append({"role": "user", "content": question})
-        with st.chat_message("user", avatar="🧑‍💼"):
-            st.markdown(question)
-        with st.chat_message("assistant", avatar="🛡️"):
-            with st.spinner("Analysing signals..."):
-                answer = ask_ai(history, record, filtered)
-            st.markdown(answer)
-        history.append({"role": "assistant", "content": answer})
+    render_chat(chat_key, record, filtered, suggestions)
 
     st.markdown(
         """
